@@ -3,13 +3,21 @@ import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import { validateAmount, validateAsset } from "../services/assets";
+import {
+  validateProposedSignerConfig,
+  validateSignerChangeAgainstAccount,
+  snapshotToSignerConfig,
+  type ProposedSignerConfig,
+} from "../services/treasury-validation";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -81,6 +89,59 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     };
   });
 
+  // -- validate signer config -------------------------------------------------
+  app.post("/groups/:id/treasury/validate-signers", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireAdmin(id, auth.id);
+    
+    const body = z
+      .object({
+        signers: z.array(
+          z.object({
+            publicKey: z.string(),
+            weight: z.number().int().min(0).max(255),
+          })
+        ),
+        thresholds: z.object({
+          low: z.number().int().min(0).max(255),
+          med: z.number().int().min(0).max(255),
+          high: z.number().int().min(0).max(255),
+        }),
+      })
+      .parse(req.body);
+
+    const group = await prisma.group.findUnique({ where: { id } });
+    if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
+      throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
+    }
+
+    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    
+    const proposedConfig: ProposedSignerConfig = {
+      signers: body.signers,
+      thresholds: body.thresholds,
+    };
+
+    const validation = validateProposedSignerConfig(proposedConfig, snapshot);
+    
+    await audit({
+      userId: auth.id,
+      action: "treasury.signer_validation",
+      entityType: "group",
+      entityId: id,
+      metadata: {
+        valid: validation.valid,
+        errors: validation.errors,
+      },
+    });
+
+    return {
+      valid: validation.valid,
+      errors: validation.errors,
+    };
+  });
+
   // -- deposit ----------------------------------------------------------------
   app.post("/groups/:id/treasury/deposit", async (req) => {
     const auth = requireUser(req);
@@ -93,6 +154,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         assetIssuer: z.string().nullable().optional(),
       })
       .parse(req.body);
+
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
@@ -149,6 +213,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         destination: z.string(),
       })
       .parse(req.body);
+
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (!StrKey.isValidEd25519PublicKey(body.destination)) {
       throw Errors.badRequest("invalid_destination", "Invalid destination public key");
@@ -245,7 +312,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         where: { id },
         data: { status: "failed" },
       });
-      throw e;
+      if (e instanceof AppError) throw e;
+      throw Errors.upstream("Transaction submission failed");
     }
 
     const updated = await prisma.treasuryTransaction.update({
@@ -266,13 +334,48 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   // -- history ----------------------------------------------------------------
   app.get("/groups/:id/treasury/history", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
+    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    await requireMembership(groupId, auth.id);
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: { groupId: id },
+      where: {
+        groupId,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: { user: true },
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { transactions: transactions.map(serializeTreasuryTx) };
+
+    const hasMore = transactions.length > limit;
+    const results = hasMore ? transactions.slice(0, limit) : transactions;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      transactions: results.map(serializeTreasuryTx),
+      meta: { nextCursor, hasMore },
+    };
   });
 }

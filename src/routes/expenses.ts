@@ -8,7 +8,9 @@ import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 const shareInput = z.object({
   userId: z.string(),
@@ -44,9 +46,8 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
-    if (!isPositive(body.amount)) {
-      throw Errors.badRequest("invalid_amount", "Amount must be greater than zero");
-    }
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -80,36 +81,41 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
         },
-      },
-      include: expenseInclude,
-    });
+        include: expenseInclude,
+      });
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+        },
+      });
+
+      return created;
     });
 
     return { expense: serializeExpense(expense) };
@@ -119,14 +125,48 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const expenses = await prisma.expense.findMany({
-      where: { groupId },
+      where: {
+        groupId,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: expenseInclude,
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { expenses: expenses.map(serializeExpense) };
+
+    const hasMore = expenses.length > limit;
+    const results = hasMore ? expenses.slice(0, limit) : expenses;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      expenses: results.map(serializeExpense),
+      meta: { nextCursor, hasMore },
+    };
   });
 
   // -- get one ----------------------------------------------------------------
@@ -146,14 +186,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        title: z.string().min(1).max(80).optional(),
-        description: z.string().max(500).nullable().optional(),
-        memo: z.string().max(24).optional(),
-        receiptUrl: z.string().nullable().optional(),
-      })
-      .parse(req.body);
+    const body = updateExpenseSchema.parse(req.body);
 
     const expense = await prisma.expense.findUnique({ where: { id } });
     if (!expense) throw Errors.notFound("Expense not found");
@@ -199,12 +232,16 @@ export default async function expenseRoutes(app: FastifyInstance) {
       );
     }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id } });
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: id,
+        },
+      });
     });
     return { ok: true };
   });
