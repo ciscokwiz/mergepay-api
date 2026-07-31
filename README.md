@@ -124,6 +124,43 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 
+### Rate limiting
+
+Every route is covered by a global default limit
+(`RATE_LIMIT_GLOBAL_MAX` / `RATE_LIMIT_GLOBAL_WINDOW_MS`, default 100 per
+minute), plus route-appropriate overrides for endpoints with different
+traffic patterns or trust boundaries:
+
+| Route(s) | Variables | Default |
+| --- | --- | --- |
+| `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /expenses/:id/settle`, `POST /groups/:id/settlements` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
+
+Limit keys are the authenticated user's internal id when available
+(never a Stellar public key), or the resolved client IP otherwise —
+`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy`
+option is explicitly enabled, which this app does not do by default. If
+you deploy behind a reverse proxy or load balancer and want per-client
+(rather than per-proxy) limiting, enable `trustProxy` in `src/app.ts` and
+make sure only your proxy can reach the app directly.
+
+The anchor webhook's rate limit is abuse protection only — it never
+replaces the shared-secret (`ANCHOR_WEBHOOK_SECRET`) check, which remains
+the actual authentication gate for that route.
+
+By default (`RATE_LIMIT_STORE=memory`) counters live in each API process's
+memory, which is fine for a single instance. Set `RATE_LIMIT_STORE=database`
+to share counters across multiple instances via a small Postgres-backed
+store (`rate_limit_buckets` table, see
+`src/services/rate-limit-store.ts`). That store fails **open**: if a count
+query errors (e.g. a transient database outage), the request is allowed
+through rather than the whole API returning 500s — a degraded rate limiter
+is preferable to a full outage. Every 429 response includes standard
+`Retry-After` / `X-RateLimit-*` headers.
+
 ## How it works
 
 ### SEP-10 login
@@ -182,6 +219,40 @@ Tests run **without a database or network** — Prisma and Horizon are mocked. T
 cover the settlement engine (splits, net balances, greedy suggestions), money
 math, SEP-10 challenge/verify, signed-XDR validation, and the auth & group routes
 via `app.inject`.
+
+## Local API exploration (REST Client)
+
+[docs/api.http](docs/api.http) is a committed request collection for the
+[VS Code REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client)
+extension (also compatible with JetBrains HTTP Client). It walks the full happy
+path end-to-end:
+
+1. **SEP-10 auth** — challenge & verify (you sign the challenge with your
+   Stellar secret key via [Stellar Laboratory](https://laboratory.stellar.org)
+   or the SDK)
+2. **Create a group**
+3. **Add an expense** (equal split)
+4. **Attempt settlement** (requires a second group member as payer)
+5. **Fetch personal history**
+
+### Getting a token
+
+1. Open `docs/api.http` in VS Code.
+2. Run **1. Health Check** to confirm the server is running.
+3. Generate a Stellar keypair — use the
+   [Stellar Laboratory](https://laboratory.stellar.org/#account-creator?network=testnet)
+   or run:
+   ```bash
+   node -e "console.log(require('@stellar/stellar-sdk').Keypair.random().secret())"
+   ```
+4. Replace `GDULW5...` in **2. SEP-10 Challenge** with your public key and send.
+5. Copy the `transaction` XDR from the response, sign it with your secret key
+   (see instructions in the file), and paste the signed XDR into **3. SEP-10 Verify**.
+6. After a successful verify, copy the `token` value and paste it into the
+   `@token` variable at the top of the file.
+
+Subsequent requests use `{{token}}` automatically. Response variables
+(`@name` / `{{…}}`) chain group and expense IDs for you.
 
 ## Deployment
 
