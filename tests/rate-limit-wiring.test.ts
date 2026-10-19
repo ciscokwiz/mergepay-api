@@ -154,9 +154,18 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     ["POST", "/api/v1/auth/challenge", "authChallenge"],
     ["POST", "/api/v1/auth/verify", "authVerify"],
     ["POST", "/api/v1/auth/refresh", "authVerify"],
+    // Session teardown (#682). Keyed by IP for the same reason as the two
+    // above: the route answers `ok` without a valid token on purpose, so
+    // there is no identity to key by on the path that does the work.
+    ["POST", "/api/v1/auth/logout", "authLogout"],
     // Expense creation writes a row and starts a payment split, so it is
     // budgeted on its own rather than drawing on the settlement budget.
     ["POST", "/api/v1/groups/:id/expenses", "expenseCreate"],
+    // Issue #682 — the writes after creation. Amending or deleting an expense
+    // rewrites every other participant's obligations, and was on the global
+    // bucket while creation had its own.
+    ["PATCH", "/api/v1/expenses/:id", "expenseMutate"],
+    ["DELETE", "/api/v1/expenses/:id", "expenseMutate"],
     // Settlement submission and confirmation.
     ["POST", "/api/v1/expenses/:id/settle", "settlementCreate"],
     ["POST", "/api/v1/groups/:id/settlements", "settlementCreate"],
@@ -179,6 +188,10 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     // Issue #657's collection-style aliases of the same two operations.
     ["POST", "/api/v1/treasury/propose", "treasuryPropose"],
     ["POST", "/api/v1/treasury/:id/sign", "treasurySubmit"],
+    // Issue #682 — deciding *who* may move group funds, as opposed to moving
+    // it. Both routes read live account state from Horizon per call.
+    ["POST", "/api/v1/groups/:id/treasury/enable", "treasuryConfig"],
+    ["POST", "/api/v1/groups/:id/treasury/validate-signers", "treasuryConfig"],
     // Anchor / SEP-24. Initiation fans out upstream, so it is the tightest.
     ["POST", "/api/v1/anchors/deposit", "anchorInit"],
     ["POST", "/api/v1/anchors/withdraw", "anchorInit"],
@@ -194,6 +207,11 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     // The list form of the same poll (#655): one page of the same DB-only
     // status reads, so it takes the same budget rather than a new one.
     ["GET", "/api/v1/sep24/transactions", "anchorPoll"],
+    // Issue #693 — the withdrawal status read a client polls through an
+    // interactive anchor flow. The same DB-only status read as the session
+    // polls above, and it was the one anchor-transaction route left on the
+    // global bucket.
+    ["GET", "/api/v1/withdraw/:id", "anchorPoll"],
     ["POST", "/api/v1/anchors/webhook", "anchorWebhook"],
     ["POST", "/api/v1/sep24/callback", "sep24Callback"],
     ["POST", "/api/v1/webhooks/sep24", "sep24Webhook"],
@@ -208,6 +226,10 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     ["POST", "/api/v1/groups/join", "groupJoin"],
     ["POST", "/api/v1/webhooks", "webhookCreate"],
     ["POST", "/api/v1/groups/:groupId/webhooks", "webhookCreate"],
+    // Issue #693 — ringing a registered endpoint. `webhookCreate` bounded
+    // registering one; this is the cheaper half of the same amplification, so
+    // it takes the tightest budget in the table.
+    ["POST", "/api/v1/groups/:groupId/webhooks/:webhookId/test", "webhookTest"],
     ["POST", "/api/v1/uploads/receipt", "uploadReceipt"],
   ];
 

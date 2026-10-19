@@ -20,9 +20,14 @@ import { config } from "../config";
  *   - truncated or otherwise corrupted envelopes.
  *
  * The check is parse-level: it confirms the envelope decodes for the given
- * network passphrase but does not verify signatures or transaction intent —
- * that deeper validation lives with the handlers that need it (see
- * `validateSignedXdr` in src/services/stellar.ts).
+ * network passphrase but does not verify signatures or transaction intent.
+ * That deeper validation has exactly one home — `src/services/stellar.ts` for
+ * the submission paths that throw, and `src/services/xdr-inspection.ts` for
+ * callers that want the diverging field reported instead (issue #694). A
+ * second intent validator used to live in this module and was weaker than
+ * both: it never checked signatures or sequence numbers, compared amounts as
+ * raw strings, and mis-reported fee-bump envelopes. Add nothing of that kind
+ * here.
  *
  * @param xdr - Candidate base64 XDR string.
  * @param networkPassphrase - Defaults to the configured Stellar network; the
@@ -43,86 +48,5 @@ export function isValidXdr(
     return true;
   } catch {
     return false;
-  }
-}
-
-/**
- * Details expected from a payment intent or expense record for XDR validation.
- */
-export interface TransactionIntentExpectation {
-  sourcePublicKey: string;
-  destination: string;
-  assetCode: string;
-  assetIssuer?: string | null;
-  amount: string;
-  memo?: string;
-}
-
-/**
- * Inspect a signed transaction XDR and validate its operations against expected intent.
- */
-export function validateTransactionIntent(
-  signedXdr: string,
-  expectation: TransactionIntentExpectation,
-  networkPassphrase: string = config.networkPassphrase
-): { valid: boolean; error?: string } {
-  try {
-    const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
-    if (!(tx instanceof TransactionBuilder.fromXDR(signedXdr, networkPassphrase).constructor)) {
-      // Using Transaction / FeeBumpTransaction check via instanceof
-    }
-
-    const envelope = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
-    // @stellar/stellar-sdk Transaction has operations and source
-    const operations = (envelope as any).operations;
-    if (!operations || operations.length !== 1) {
-      return { valid: false, error: "Transaction must contain exactly one operation" };
-    }
-
-    const op = operations[0];
-    if (op.type !== "payment") {
-      return { valid: false, error: "Transaction operation must be a payment" };
-    }
-
-    // Validate source account
-    const source = op.source || (envelope as any).source;
-    if (source && source !== expectation.sourcePublicKey) {
-      return { valid: false, error: "Transaction source account mismatch" };
-    }
-
-    // Validate destination
-    if (op.destination !== expectation.destination) {
-      return { valid: false, error: "Payment destination mismatch" };
-    }
-
-    // Validate asset
-    const assetCode = op.asset.isNative() ? "XLM" : op.asset.getCode();
-    const assetIssuer = op.asset.isNative() ? null : op.asset.getIssuer();
-
-    if (assetCode !== expectation.assetCode) {
-      return { valid: false, error: "Payment asset code mismatch" };
-    }
-
-    if ((expectation.assetIssuer ?? null) !== (assetIssuer ?? null)) {
-      return { valid: false, error: "Payment asset issuer mismatch" };
-    }
-
-    // Validate amount
-    if (op.amount !== expectation.amount) {
-      return { valid: false, error: "Payment amount mismatch" };
-    }
-
-    // Validate memo if present in expectation
-    if (expectation.memo) {
-      const memoValue = (envelope as any).memo;
-      const memoString = memoValue && memoValue.value ? memoValue.value.toString() : "";
-      if (memoString !== expectation.memo) {
-        return { valid: false, error: "Transaction memo mismatch" };
-      }
-    }
-
-    return { valid: true };
-  } catch (err: any) {
-    return { valid: false, error: err?.message || "Failed to parse transaction XDR" };
   }
 }

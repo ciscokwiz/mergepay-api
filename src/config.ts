@@ -414,6 +414,34 @@ const schema = z.object({
   // they share with every read the same client makes.
   RATE_LIMIT_UPLOAD_RECEIPT_MAX: z.coerce.number().int().positive().max(100000).default(20),
   RATE_LIMIT_UPLOAD_RECEIPT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Issues #682 / #693 — the remaining sensitive routes that were still
+  // answering from the global bucket. Each is budgeted for the work *it*
+  // causes, not for the size of its response body.
+  //
+  // Logout revokes every refresh token a user holds, and the route answers
+  // `{ ok: true }` whether or not the bearer token was valid — deliberately,
+  // so it is not an oracle for token validity, but that also means an
+  // anonymous caller can drive the write path. Keyed by IP, like the other
+  // pre-session auth routes.
+  RATE_LIMIT_AUTH_LOGOUT_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_AUTH_LOGOUT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Editing or deleting an expense rewrites the obligations of every other
+  // participant. `RATE_LIMIT_EXPENSE_CREATE_*` bounded only creation, so the
+  // mutations that follow it drew on the global allowance instead.
+  RATE_LIMIT_EXPENSE_MUTATE_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_EXPENSE_MUTATE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Treasury signer configuration: enabling a treasury and validating a
+  // proposed signer set both read live account state from Horizon, so each
+  // call spends upstream budget, and both decide who may move group funds.
+  // Tight, because neither is an operation a client repeats in bursts.
+  RATE_LIMIT_TREASURY_CONFIG_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_TREASURY_CONFIG_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Firing a test webhook turns one inbound request into an outbound HTTP
+  // delivery to a caller-registered URL, on the same retry schedule as a real
+  // event. `RATE_LIMIT_WEBHOOK_CREATE_*` bounded registering an endpoint but
+  // not ringing it, which is the cheaper half of the same amplification.
+  RATE_LIMIT_WEBHOOK_TEST_MAX: z.coerce.number().int().positive().max(100000).default(5),
+  RATE_LIMIT_WEBHOOK_TEST_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
   // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
   TRUSTED_PROXY_IPS: z.string().default(""),

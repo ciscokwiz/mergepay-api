@@ -275,6 +275,11 @@ export default async function authRoutes(app: FastifyInstance) {
   app.post(
     "/auth/logout",
     {
+      // Keyed by IP on `onRequest`: the handler deliberately answers `ok` for
+      // an absent or invalid token, so there is no identity to key by, and
+      // every accepted call revokes a user's refresh tokens and writes an
+      // audit row.
+      ...rateLimited("authLogout"),
       schema: {
         tags: ["Auth"],
         summary: "Log out user session",

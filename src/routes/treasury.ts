@@ -57,6 +57,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/enable",
     {
+      // Decides which account holds group funds, and reads live account state
+      // from Horizon on the way — budgeted apart from the routes that move
+      // the money.
+      ...rateLimited("treasuryConfig"),
       preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],
@@ -168,6 +172,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/validate-signers",
     {
+      // One Horizon account read per call, so this is upstream budget an
+      // admin session can spend without changing anything.
+      ...rateLimited("treasuryConfig"),
       preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],

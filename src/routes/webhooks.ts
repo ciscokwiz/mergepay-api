@@ -13,6 +13,12 @@ import {
   verifySep24Signature,
 } from "../services/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
+import {
+  deliveryListQuerySchema,
+  listGroupWebhooks,
+  listWebhookDeliveries,
+  webhookListQuerySchema,
+} from "../services/webhook-listing";
 import { audit } from "../services/audit";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
@@ -291,15 +297,17 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { webhook: publicWebhook(webhook, true) };
   });
 
+  // Paginated like every other list endpoint (#692). The endpoint count per
+  // group is small today, but an unbounded `findMany` is a response size no
+  // caller can predict, and a client that has to handle `meta` here handles
+  // it on the delivery list below too.
   app.get("/groups/:groupId/webhooks", asMember, async (req) => {
     const { groupId } = paramsSchema.parse(req.params);
+    const query = webhookListQuerySchema.parse(req.query ?? {});
 
-    const webhooks = await (prisma as any).webhook.findMany({
-      where: { groupId },
-      orderBy: { createdAt: "desc" },
-    });
+    const { items, meta } = await listGroupWebhooks(groupId, query);
 
-    return { webhooks: webhooks.map((webhook: any) => publicWebhook(webhook)) };
+    return { webhooks: items.map((webhook: any) => publicWebhook(webhook)), meta };
   });
 
   app.delete("/groups/:groupId/webhooks/:webhookId", asAdmin, async (req) => {
@@ -328,7 +336,13 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { deleted: true };
   });
 
-  app.post("/groups/:groupId/webhooks/:webhookId/test", asMember, async (req) => {
+  // Asking the server to ring a registered endpoint: one inbound request
+  // becomes an outbound delivery on the same retry schedule as a real event,
+  // so it carries the tightest write budget in the table (#693).
+  app.post(
+    "/groups/:groupId/webhooks/:webhookId/test",
+    { ...rateLimited("webhookTest"), ...asMember },
+    async (req) => {
     const auth = requireUser(req);
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
 
@@ -350,8 +364,18 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { queued: true };
   });
 
+  // Delivery history: one row per event per endpoint, kept for every retry,
+  // so this is the list that grows without bound (#692). Paged and filterable
+  // by delivery status and event type — the question a caller actually has is
+  // "what is failing to reach my endpoint", which should not require reading
+  // every success first.
+  //
+  // The response carries `deliverySummary` fields only: a delivery row also
+  // holds the signed request body and the receiver's response text, neither of
+  // which belongs in a list response. See src/services/webhook-listing.ts.
   app.get("/groups/:groupId/webhooks/:webhookId/deliveries", asMember, async (req) => {
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
+    const query = deliveryListQuerySchema.parse(req.query ?? {});
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId },
@@ -359,11 +383,11 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     });
     if (!webhook) throw Errors.notFound("Webhook not found");
 
-    const deliveries = await (prisma as any).webhookDelivery.findMany({
-      where: { webhookId },
-      orderBy: { createdAt: "desc" },
-    });
+    // Scoped by the endpoint id resolved above, which was itself scoped to the
+    // caller's group — the cursor only decides where inside that set the page
+    // starts.
+    const { items, meta } = await listWebhookDeliveries(webhookId, query);
 
-    return { deliveries };
+    return { deliveries: items, meta };
   });
 }

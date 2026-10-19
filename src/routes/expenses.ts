@@ -65,6 +65,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // against the settlement routes below never draw down this allowance.
   const createLimit = rateLimited("expenseCreate");
 
+  // Amending or deleting an expense rewrites what every other participant
+  // owes, so the mutations get their own per-user budget rather than drawing
+  // on the global allowance. Separate from `createLimit`: a client correcting
+  // a typo must not exhaust the allowance that guards opening new
+  // obligations.
+  const mutateLimit = rateLimited("expenseMutate");
+
   app.post(
     "/groups/:id/expenses",
     {
@@ -256,6 +263,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch(
     "/expenses/:id",
     {
+      ...mutateLimit,
       preHandler: requireGroupRole("member", { param: "id", fromExpense: true, active: true }),
       schema: {
         tags: ["Expenses"],
@@ -314,6 +322,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.delete(
     "/expenses/:id",
     {
+      ...mutateLimit,
       preHandler: requireGroupRole("member", { param: "id", fromExpense: true, active: true }),
       schema: {
         tags: ["Expenses"],

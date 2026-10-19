@@ -259,6 +259,11 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
   app.get(
     "/withdraw/:id",
     {
+      // The anchor-transaction status read a client polls while an
+      // interactive withdrawal runs, so it takes the same budget as the other
+      // anchor polls (#693) rather than the global one it shares with every
+      // unrelated read.
+      ...rateLimited("anchorPoll"),
       preHandler: [app.authenticate],
       schema: {
         tags: ["SEP-24"],

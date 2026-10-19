@@ -663,27 +663,42 @@ export function verifySignedPaymentXdr(
 }
 
 /**
- * True only if at least one signature on the envelope verifies against the
- * transaction's own source account, hashed with our configured network
- * passphrase. An empty signature list (unsigned) or a signature produced
- * against a different network passphrase both fail this check.
+ * True only if at least one signature on the envelope verifies against
+ * `publicKey`, over the transaction hash — which is computed from bytes that
+ * include the network passphrase, so a signature produced for another network
+ * fails here too. An unsigned envelope, and a `publicKey` that is not a valid
+ * ed25519 account, both answer false rather than throwing: the caller's job is
+ * to reject, and an unparseable key is not a signature it can accept.
+ *
+ * Exported because this is the only signature check in the codebase — the
+ * submission paths, the multisig collector, and the non-throwing inspector in
+ * src/services/xdr-inspection.ts all route through it.
  */
-function hasValidSourceSignature(tx: Transaction): boolean {
+export function verifySourceSignature(tx: Transaction, publicKey: string): boolean {
   if (!tx.signatures || tx.signatures.length === 0) return false;
-  let sourceKeypair: Keypair;
+  let keypair: Keypair;
   try {
-    sourceKeypair = Keypair.fromPublicKey(tx.source);
+    keypair = Keypair.fromPublicKey(publicKey);
   } catch {
     return false;
   }
   const hash = tx.hash();
   return tx.signatures.some((sig) => {
     try {
-      return sourceKeypair.verify(hash, sig.signature());
+      return keypair.verify(hash, sig.signature());
     } catch {
       return false;
     }
   });
+}
+
+/**
+ * {@link verifySourceSignature} against the envelope's *own* declared source,
+ * for the paths that check authorship before they know which account the
+ * intent names.
+ */
+function hasValidSourceSignature(tx: Transaction): boolean {
+  return verifySourceSignature(tx, tx.source);
 }
 
 /**
@@ -698,7 +713,17 @@ export interface PaymentExpectation {
   asset: AssetSpec;
   amount: string;
   memoCode: string;
-  /** Sequence used when the server created the unsigned intent. */
+  /**
+   * The envelope's **own** sequence number, as `tx.sequence` reports it.
+   *
+   * Note the off-by-one against `stellar.buildPayment`, whose `sourceSequence`
+   * argument is the *account* sequence Horizon reported: a transaction built
+   * from account sequence `n` carries sequence `n + 1`. An intent that records
+   * the account sequence must add one before putting it here, or the check
+   * below rejects every envelope it was built for. Left unset — as every
+   * caller leaves it today, there being no persisted column — the sequence is
+   * not checked.
+   */
   sourceSequence?: string;
   /** Maximum fee per operation accepted for this intent. */
   maxFeeStroops?: number;
@@ -766,23 +791,66 @@ export function assertTimeBoundsValid(
 }
 
 /**
- * Structural check that a transaction is exactly the payment we authorized.
+ * Which part of the envelope diverged from the intent.
+ *
+ * The name is stable and machine-readable, so a caller that needs to react to
+ * *what* diverged (an inspector reporting a field, a log line grouping
+ * rejections by cause) does not have to pattern-match on prose. One name per
+ * check in {@link matchPaymentIntent}.
+ */
+export type PaymentIntentField =
+  | "source"
+  | "sequence"
+  | "operationCount"
+  | "fee"
+  | "operationType"
+  | "operationSource"
+  | "destination"
+  | "assetIssuer"
+  | "asset"
+  | "amount"
+  | "memo";
+
+/** A single divergence between an envelope and the intent it should match. */
+export interface PaymentIntentMismatch {
+  field: PaymentIntentField;
+  message: string;
+}
+
+/**
+ * Structural check that a transaction is exactly the payment we authorized,
+ * reported rather than thrown.
  *
  * Ordered deliberately: shape before content, so an envelope carrying extra
  * operations is reported as such rather than as an incidental fee or asset
- * mismatch further down.
+ * mismatch further down. Returns the *first* divergence, or null when the
+ * envelope matches — signatures are not its concern (see
+ * {@link verifySourceSignature}).
+ *
+ * This is the single description of what "matches the intent" means.
+ * `assertMatchesIntent` below throws it as an `AppError` for the submission
+ * paths; `src/services/xdr-inspection.ts` reports it field-by-field for
+ * callers that want to inspect an envelope without raising. Neither has a
+ * second copy of the rules.
+ *
+ * @throws {AppError} only when `expected.asset` is not an asset this
+ *   deployment supports — that is a fault in the *expectation* (a stored row
+ *   or a caller's argument), not in the envelope being judged.
  */
-function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): void {
+export function matchPaymentIntent(
+  tx: Transaction,
+  expected: PaymentExpectation
+): PaymentIntentMismatch | null {
   if (tx.source !== expected.sourcePublicKey) {
-    throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
+    return { field: "source", message: "Transaction source does not match" };
   }
 
   if (expected.sourceSequence !== undefined && tx.sequence.toString() !== expected.sourceSequence) {
-    throw Errors.badRequest("xdr_mismatch", "Transaction sequence does not match");
+    return { field: "sequence", message: "Transaction sequence does not match" };
   }
 
   if (tx.operations.length !== 1) {
-    throw Errors.badRequest("xdr_mismatch", "Expected exactly one operation");
+    return { field: "operationCount", message: "Expected exactly one operation" };
   }
 
   const fee = Number(tx.fee);
@@ -792,21 +860,21 @@ function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): voi
     fee < MIN_FEE_STROOPS_PER_OP * tx.operations.length ||
     fee > maxFee
   ) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Transaction fee is outside the accepted range"
-    );
+    return { field: "fee", message: "Transaction fee is outside the accepted range" };
   }
 
   const op = tx.operations[0] as any;
   if (op.type !== "payment") {
-    throw Errors.badRequest("xdr_mismatch", "Expected a payment operation");
+    return { field: "operationType", message: "Expected a payment operation" };
   }
   if (op.source && op.source !== expected.sourcePublicKey) {
-    throw Errors.badRequest("xdr_mismatch", "Payment operation source does not match");
+    return {
+      field: "operationSource",
+      message: "Payment operation source does not match",
+    };
   }
   if (op.destination !== expected.destination) {
-    throw Errors.badRequest("xdr_mismatch", "Payment destination does not match");
+    return { field: "destination", message: "Payment destination does not match" };
   }
 
   const wantAsset = toAsset(expected.asset);
@@ -815,20 +883,33 @@ function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): voi
     // An issuer swap keeps the familiar code and changes what the recipient
     // actually receives, so it is called out separately from a code mismatch.
     if (gotAsset.getCode() === wantAsset.getCode()) {
-      throw Errors.badRequest("xdr_mismatch", "Payment asset issuer mismatch");
+      return { field: "assetIssuer", message: "Payment asset issuer mismatch" };
     }
-    throw Errors.badRequest("xdr_mismatch", "Payment asset does not match");
+    return { field: "asset", message: "Payment asset does not match" };
   }
 
   if (normalizeAmount(op.amount) !== normalizeAmount(expected.amount)) {
-    throw Errors.badRequest("xdr_mismatch", "Payment amount does not match");
+    return { field: "amount", message: "Payment amount does not match" };
   }
 
   const wantMemo = memoText(expected.memoCode);
   const gotMemo =
     tx.memo && (tx.memo as any).value ? (tx.memo as any).value.toString() : "";
   if (gotMemo !== wantMemo) {
-    throw Errors.badRequest("xdr_mismatch", "Memo does not match the expense reference");
+    return { field: "memo", message: "Memo does not match the expense reference" };
+  }
+
+  return null;
+}
+
+/**
+ * {@link matchPaymentIntent} as an assertion: the submission paths want the
+ * first divergence to abort the request, with the stable `xdr_mismatch` code.
+ */
+function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): void {
+  const mismatch = matchPaymentIntent(tx, expected);
+  if (mismatch) {
+    throw Errors.badRequest("xdr_mismatch", mismatch.message);
   }
 }
 
@@ -877,16 +958,7 @@ export function validatePaymentTx(tx: Transaction, expected: PaymentExpectation)
   // Skipped for multisig accounts, whose own key never signs — verifyMultisig
   // checks authorization there instead.
   if (!expected.skipSourceSignatureCheck) {
-    const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
-    const txHash = tx.hash();
-    const hasValidSignature = tx.signatures.some((sig) => {
-      try {
-        return sourceKeypair.verify(txHash, sig.signature());
-      } catch {
-        return false;
-      }
-    });
-    if (!hasValidSignature) {
+    if (!verifySourceSignature(tx, expected.sourcePublicKey)) {
       throw Errors.badRequest(
         "xdr_mismatch",
         "Transaction signature is invalid or for the wrong network"

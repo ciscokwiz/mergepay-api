@@ -38,6 +38,16 @@ import { shortCode } from "../services/codes";
 import { audit, auditTx, logActionTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import {
+  listGroupSettlements,
+  settlementListQuerySchema,
+} from "../services/settlement-history";
+import {
+  assertValidRange as assertValidLedgerRange,
+  includesType as includesLedgerType,
+  ledgerDateFilter,
+  ledgerQuerySchema,
+} from "../services/ledger";
+import {
   readIdempotencyKey,
   requireIdempotencyKey,
   runIdempotent,
@@ -51,7 +61,6 @@ import {
   buildPage,
   cursorFilter,
   cursorOrderBy,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
@@ -917,7 +926,8 @@ export default async function settlementRoutes(app: FastifyInstance) {
       schema: {
         tags: ["Settlements"],
         summary: "List settlements for a group",
-        description: "Returns paginated settlements scoped to the caller's group membership, ordered deterministically by creation timestamp and ID.",
+        description:
+          "Returns a paginated, filterable list of the group's settlements, ordered deterministically by creation timestamp and ID. Filter by public status, asset, and an inclusive date range; pass `includeTotal=true` for a count of the filtered set.",
         params: openApiIdParams(),
         response: {
           200: {
@@ -937,18 +947,17 @@ export default async function settlementRoutes(app: FastifyInstance) {
     },
     async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    // Membership was checked by the route guard before any row is read, and
+    // the `groupId` filter the service applies is what scopes the page —
+    // never the cursor. See src/services/settlement-history.ts.
+    const query = settlementListQuerySchema.parse(req.query ?? {});
 
-    const position = requireCursor(cursor);
+    const { items, meta } = await listGroupSettlements(
+      groupId,
+      query,
+      settlementInclude
+    );
 
-    const settlements = await prisma.settlement.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
-      include: settlementInclude,
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(settlements, limit, order);
     return { settlements: items.map(serializeSettlement), meta };
   });
 
@@ -1143,32 +1152,51 @@ export default async function settlementRoutes(app: FastifyInstance) {
     { preHandler: requireGroupRole("member", { param: "id" }) },
     async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const query = ledgerQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order } = query;
+    assertValidLedgerRange(query.startDate, query.endDate);
 
     const position = requireCursor(cursor);
-    const where = { groupId, ...cursorFilter(position, order) };
+    // The date bound is pushed into each table's query rather than applied to
+    // the merged page: each table is read with its own `limit + 1` window, so
+    // filtering after the merge would shrink pages and make `hasMore`
+    // describe the unfiltered scan. See src/services/ledger.ts.
+    const where = {
+      groupId,
+      ...ledgerDateFilter(query),
+      ...cursorFilter(position, order),
+    };
     const orderBy = cursorOrderBy(order);
     const take = takeForPage(limit);
 
+    // A `type` filter selects which tables are read at all, so a request for
+    // one kind issues one query instead of three. An unasked-for kind
+    // resolves to an empty array without touching the database.
     const [expenses, settlements, treasuryTxs] = await Promise.all([
-      prisma.expense.findMany({
-        where,
-        include: { payer: true, shares: { include: { user: true } } },
-        orderBy,
-        take,
-      }),
-      prisma.settlement.findMany({
-        where,
-        include: settlementInclude,
-        orderBy,
-        take,
-      }),
-      prisma.treasuryTransaction.findMany({
-        where,
-        include: { user: true },
-        orderBy,
-        take,
-      }),
+      includesLedgerType(query, "expense")
+        ? prisma.expense.findMany({
+            where,
+            include: { payer: true, shares: { include: { user: true } } },
+            orderBy,
+            take,
+          })
+        : [],
+      includesLedgerType(query, "settlement")
+        ? prisma.settlement.findMany({
+            where,
+            include: settlementInclude,
+            orderBy,
+            take,
+          })
+        : [],
+      includesLedgerType(query, "treasury")
+        ? prisma.treasuryTransaction.findMany({
+            where,
+            include: { user: true },
+            orderBy,
+            take,
+          })
+        : [],
     ]);
 
     const direction = order === "desc" ? -1 : 1;

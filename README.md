@@ -320,18 +320,22 @@ traffic pattern or trust boundary replace that default with their own bucket:
 | --- | --- | --- |
 | `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /auth/verify`, `POST /auth/refresh` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /auth/logout` | `RATE_LIMIT_AUTH_LOGOUT_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /groups/:id/expenses` | `RATE_LIMIT_EXPENSE_CREATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `PATCH /expenses/:id`, `DELETE /expenses/:id` | `RATE_LIMIT_EXPENSE_MUTATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /expenses/:id/settle`, `POST /groups/:id/settlements`, `POST /groups/:id/treasury/deposit`, `POST /groups/:id/treasury/withdraw` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /settlements/:id/confirm`, `POST /withdraw/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /api/v1/settlements/execute` | `RATE_LIMIT_SETTLEMENT_EXECUTE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /treasury-transactions/:id/confirm`, `POST /groups/:groupId/treasury/proposals/:proposalId/sign`, `POST /api/v1/treasury/proposals/:id/signatures` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /groups/:groupId/treasury/proposals`, `POST /api/v1/treasury/proposals` | `RATE_LIMIT_TREASURY_PROPOSE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /groups/:id/treasury/enable`, `POST /groups/:id/treasury/validate-signers` | `RATE_LIMIT_TREASURY_CONFIG_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete`, `POST /api/v1/sep24/deposit`, `POST /api/v1/sep24/withdraw`, `POST /withdraw` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
-| `GET /anchors`, `GET /anchors/sessions`, `GET /anchors/sessions/:id` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
+| `GET /anchors`, `GET /anchors/sessions`, `GET /anchors/sessions/:id`, `GET /api/v1/sep24/transaction`, `GET /api/v1/sep24/transactions`, `GET /withdraw/:id` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
 | `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 50 / 1 min |
 | `POST /api/v1/sep24/callback`, `POST /api/v1/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `POST /groups` | `RATE_LIMIT_GROUP` / `_WINDOW_MS` | 10 / 1 min |
 | `GET /history` | `RATE_LIMIT_HISTORY` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /groups/:groupId/webhooks/:webhookId/test` | `RATE_LIMIT_WEBHOOK_TEST_MAX` / `_WINDOW_MS` | 5 / 1 min |
 
 **Tuning a deployment.** Every value above is an environment variable with a
 safe default, so a deployment overrides only what it needs — for example a
@@ -631,10 +635,45 @@ ordering coordinates, never a group or user id: access is decided by each
 query's own scope plus its membership check, so a cursor from one resource
 replayed against another cannot widen what the caller can read.
 
-Covers `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
-`/groups/:id/treasury/history`, `/anchors/sessions`, and `/history` (which
+Covers `GET /groups`, `/groups/:id`, `/groups/:id/expenses`,
+`/groups/:id/settlements`, `/groups/:id/ledger`,
+`/groups/:id/treasury/history`, `/groups/:groupId/treasury/proposals`,
+`/groups/:groupId/webhooks`, `/groups/:groupId/webhooks/:webhookId/deliveries`,
+`/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history` (which
 paginates its expense and settlement streams independently, via `cursor` and
 `settlementCursor`).
+
+### Filtering the transaction history
+
+The history endpoints take filters alongside the pagination parameters above.
+Filters are pushed into the database query, never applied to an already-fetched
+page: a filter applied after the fact would return pages shorter than the
+requested `limit` and make `hasMore` describe the unfiltered scan.
+
+| Endpoint | Filters |
+| --- | --- |
+| `GET /groups/:id/expenses` | `asset` (`XLM`\|`USDC`), `status` (`PENDING`\|`SETTLED`), `startDate`, `endDate`, `includeTotal` |
+| `GET /groups/:id/settlements` | `status` (`awaiting_signature`\|`submitted`\|`confirmed`\|`failed`\|`expired`), `asset`, `startDate`, `endDate`, `includeTotal` |
+| `GET /groups/:id/ledger` | `type` (one or more of `expense`,`settlement`,`treasury`), `startDate`, `endDate` |
+| `GET /groups/:groupId/webhooks/:webhookId/deliveries` | `status` (`pending`\|`delivered`\|`failed`), `event` |
+| `GET /groups/:groupId/audit-logs` | `action`, `actorUserId`, `startDate`, `endDate` |
+
+Notes that matter when integrating:
+
+- **Dates** are ISO-8601 with an offset, and both bounds are inclusive. A
+  reversed range is `INVALID_RANGE`, not an empty page.
+- **Unknown filter values** are `VALIDATION_ERROR`. A typo never silently
+  returns nothing.
+- **`includeTotal=true`** adds `meta.total`, the count of the *filtered* set
+  ignoring the cursor. It is opt-in because counting is a second query over
+  every matching row, which the cursor contract otherwise never pays for.
+- **`status` on settlements** filters by the same public status the settlement
+  status endpoint reports, including the two values derived from the signing
+  deadline rather than stored (`expired`, and `submitted` vs
+  `awaiting_signature`). The five values partition the history: every
+  settlement matches exactly one.
+- **`type` on the ledger** decides which tables are read at all, so
+  `?type=expense` issues one query instead of three.
 
 ## TypeScript strict mode
 

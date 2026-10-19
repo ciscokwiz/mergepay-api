@@ -53,7 +53,11 @@ export type RateLimitPolicyName =
   | "global"
   | "authChallenge"
   | "authVerify"
+  | "authLogout"
   | "expenseCreate"
+  | "expenseMutate"
+  | "treasuryConfig"
+  | "webhookTest"
   | "settlementCreate"
   | "settlementConfirm"
   | "settlementExecute"
@@ -116,6 +120,18 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "auth.verify",
       hook: "onRequest",
     },
+    // Session teardown (#682). Keyed by IP on `onRequest` rather than by user,
+    // because the route answers `{ ok: true }` for an absent or invalid bearer
+    // token on purpose — it must not become an oracle for token validity — so
+    // there is no identity to key by on the path that matters. Each accepted
+    // call revokes every refresh token the user holds and writes an audit row.
+    authLogout: {
+      max: config.RATE_LIMIT_AUTH_LOGOUT_MAX,
+      timeWindow: config.RATE_LIMIT_AUTH_LOGOUT_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "auth.logout",
+      hook: "onRequest",
+    },
     // Its own bucket, keyed by the authenticated user. Expense creation is the
     // write that opens an obligation for every other participant, so it is
     // budgeted separately from the settlement routes that later close it: a
@@ -126,6 +142,18 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_EXPENSE_CREATE_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "expense.create",
+      hook: "preHandler",
+    },
+    // The edits that follow a creation (#682). `expenseCreate` guards the
+    // write that opens the obligations; amending or deleting an expense
+    // rewrites what every other participant owes, and until now spent only
+    // the caller's global allowance. Its own bucket, so a client correcting a
+    // typo cannot exhaust the budget that guards creating new expenses.
+    expenseMutate: {
+      max: config.RATE_LIMIT_EXPENSE_MUTATE_MAX,
+      timeWindow: config.RATE_LIMIT_EXPENSE_MUTATE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "expense.mutate",
       hook: "preHandler",
     },
     settlementCreate: {
@@ -164,6 +192,19 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "treasury.propose",
+      hook: "preHandler",
+    },
+    // Treasury signer configuration (#682): enabling a treasury, and
+    // validating a proposed signer set. Both read live account state from
+    // Horizon — so each call spends upstream budget — and both decide who may
+    // move group funds. Budgeted apart from `treasuryPropose` /
+    // `treasurySubmit`, which bound moving the money rather than deciding who
+    // can.
+    treasuryConfig: {
+      max: config.RATE_LIMIT_TREASURY_CONFIG_MAX,
+      timeWindow: config.RATE_LIMIT_TREASURY_CONFIG_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "treasury.config",
       hook: "preHandler",
     },
     anchorInit: {
@@ -263,6 +304,18 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_WEBHOOK_CREATE_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "webhook.create",
+      hook: "preHandler",
+    },
+    // Ringing a registered endpoint (#693). `webhookCreate` bounds registering
+    // one; this bounds asking the server to call it. One inbound request
+    // becomes an outbound delivery with the same retry schedule as a real
+    // event, so this is the tightest write budget in the table — a test fire
+    // is something a client does once to confirm wiring, never in a loop.
+    webhookTest: {
+      max: config.RATE_LIMIT_WEBHOOK_TEST_MAX,
+      timeWindow: config.RATE_LIMIT_WEBHOOK_TEST_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "webhook.test",
       hook: "preHandler",
     },
     // Multipart uploads write to disk. Sharing the global bucket with reads

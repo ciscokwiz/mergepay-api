@@ -1264,3 +1264,202 @@ describe("sensitive authentication and payment endpoints rate limiting (#523)", 
     expect(authed.headers["x-ratelimit-remaining"]).toBe("0");
   });
 });
+
+/**
+ * Issues #682 / #693 — the sensitive routes that were still answering from the
+ * global bucket.
+ *
+ * The tiers for SEP-10 auth, settlement submission, and anchor initiation were
+ * already in place. What the table did not model was a second group of routes
+ * whose cost is not in their response:
+ *
+ *  - `POST /auth/logout` revokes every refresh token a user holds and writes
+ *    an audit row, and answers `ok` whether or not the bearer token was valid
+ *    — so the write path is reachable anonymously;
+ *  - `PATCH` / `DELETE /expenses/:id` rewrite what every other participant
+ *    owes, while only expense *creation* had a budget;
+ *  - `POST /groups/:id/treasury/enable` and `.../validate-signers` each read
+ *    live account state from Horizon and decide who may move group funds;
+ *  - `GET /withdraw/:id` is the anchor-transaction status read a client polls
+ *    through an interactive flow — the one anchor route left unbudgeted;
+ *  - `POST /groups/:groupId/webhooks/:webhookId/test` turns one inbound
+ *    request into an outbound HTTP delivery with a retry schedule.
+ *
+ * Each case drives the real app past the policy's budget, so it fails if the
+ * annotation is dropped from the route declaration, and asserts the same three
+ * properties as the suites above: the per-route limit is what the headers
+ * report, the 429 carries the standard envelope, and the bucket is the
+ * policy's own rather than the global one.
+ */
+describe("sensitive routes left on the global bucket (#682, #693)", () => {
+  it("POST /auth/logout — per-route budget, headers, and 429 envelope", async () => {
+    // No Authorization header: the handler returns `{ ok: true }` immediately,
+    // which is exactly the path an anonymous caller can drive.
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/auth/logout",
+      max: policies.authLogout.max,
+      label: "auth/logout",
+    });
+  });
+
+  it("POST /auth/logout is keyed by IP, so a bearer token buys no second budget", async () => {
+    const remoteAddress = "198.51.100.182";
+    const max = policies.authLogout.max;
+    for (let i = 0; i < max; i++) {
+      await app.inject({ method: "POST", url: "/auth/logout", remoteAddress });
+    }
+    const authed = await app.inject({
+      method: "POST",
+      url: "/auth/logout",
+      remoteAddress,
+      headers: authHeader(),
+    });
+    expect(authed.statusCode).toBe(429);
+  });
+
+  it("PATCH /expenses/:id — per-route budget, headers, and 429 envelope", async () => {
+    await exhaustAndAssert({
+      method: "PATCH",
+      url: "/expenses/expense_rate_limit",
+      max: policies.expenseMutate.max,
+      headers: authHeader(),
+      payload: { title: "Edited" },
+      label: "expenses/:id (patch)",
+    });
+  });
+
+  it("DELETE /expenses/:id — per-route budget, headers, and 429 envelope", async () => {
+    // PATCH and DELETE both name `expenseMutate`, so they enforce the same
+    // numbers under the same per-user key. Whether they also share a *counter*
+    // depends on the store: `RATE_LIMIT_STORE=database` keeps one row per key,
+    // while the default in-memory store gives each route its own child store.
+    // What every deployment must hold either way is that each route enforces
+    // the policy, which is what this asserts.
+    await exhaustAndAssert({
+      method: "DELETE",
+      url: "/expenses/expense_rate_limit_delete",
+      max: policies.expenseMutate.max,
+      headers: authHeader(),
+      label: "expenses/:id (delete)",
+    });
+  });
+
+  it("expense edits do not spend the expense-creation budget", async () => {
+    // Separate key prefixes: a client correcting typos must not exhaust the
+    // allowance that guards opening new obligations.
+    const headers = authHeader();
+    for (let i = 0; i < policies.expenseMutate.max + 1; i++) {
+      await app.inject({
+        method: "PATCH",
+        url: "/expenses/expense_independent",
+        headers,
+        payload: { title: "Edited" },
+      });
+    }
+    const create = await app.inject({
+      method: "POST",
+      url: "/groups/00000000-0000-0000-0000-000000000000/expenses",
+      headers,
+      payload: {
+        title: "Dinner",
+        amount: "10.0000000",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [],
+      },
+    });
+    expect(create.statusCode).not.toBe(429);
+  });
+
+  it("POST /groups/:id/treasury/enable — per-route budget, headers, and 429 envelope", async () => {
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/groups/00000000-0000-0000-0000-000000000000/treasury/enable",
+      max: policies.treasuryConfig.max,
+      headers: authHeader(),
+      payload: { publicKey: Keypair.random().publicKey() },
+      label: "treasury/enable",
+    });
+  });
+
+  it("POST /groups/:id/treasury/validate-signers — per-route budget and 429 envelope", async () => {
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/groups/00000000-0000-0000-0000-000000000000/treasury/validate-signers",
+      max: policies.treasuryConfig.max,
+      headers: authHeader(),
+      payload: {},
+      label: "treasury/validate-signers",
+    });
+  });
+
+  it("treasury configuration does not spend the budget that guards moving funds", async () => {
+    // `treasuryConfig` has its own key prefix, so exhausting it leaves
+    // `treasuryPropose` — the budget for actually moving money — intact.
+    const headers = authHeader();
+    const enableUrl = "/groups/00000000-0000-0000-0000-000000000000/treasury/enable";
+    for (let i = 0; i < policies.treasuryConfig.max + 1; i++) {
+      await app.inject({
+        method: "POST",
+        url: enableUrl,
+        headers,
+        payload: { publicKey: Keypair.random().publicKey() },
+      });
+    }
+    const propose = await app.inject({
+      method: "POST",
+      url: "/treasury/proposals",
+      headers,
+      payload: {},
+    });
+    expect(propose.statusCode).not.toBe(429);
+  });
+
+  it("GET /withdraw/:id — takes the anchor-poll budget, not the global one", async () => {
+    await exhaustAndAssert({
+      method: "GET",
+      url: "/withdraw/wth_rate_limit_read",
+      max: policies.anchorPoll.max,
+      headers: authHeader(),
+      label: "withdraw/:id (read)",
+    });
+  });
+
+  it("POST /groups/:groupId/webhooks/:webhookId/test — per-route budget, headers, and 429 envelope", async () => {
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/groups/00000000-0000-0000-0000-000000000000/webhooks/wh_rate_limit/test",
+      max: policies.webhookTest.max,
+      headers: authHeader(),
+      label: "webhooks/:id/test",
+    });
+  });
+
+  it("firing a test delivery does not spend the webhook-registration budget", async () => {
+    const headers = authHeader();
+    const base = "/groups/00000000-0000-0000-0000-000000000000/webhooks";
+    for (let i = 0; i < policies.webhookTest.max + 1; i++) {
+      await app.inject({ method: "POST", url: `${base}/wh_independent/test`, headers });
+    }
+    const register = await app.inject({
+      method: "POST",
+      url: base,
+      headers,
+      payload: { url: "https://example.test/hook", events: ["expense.created"] },
+    });
+    expect(register.statusCode).not.toBe(429);
+  });
+
+  it("every newly budgeted route is tighter than the global default", async () => {
+    for (const name of [
+      "authLogout",
+      "expenseMutate",
+      "treasuryConfig",
+      "webhookTest",
+    ] as const) {
+      expect(policies[name].max, name).toBeLessThan(policies.global.max);
+      expect(policies[name].prefix, name).not.toBe(policies.global.prefix);
+    }
+  });
+});
